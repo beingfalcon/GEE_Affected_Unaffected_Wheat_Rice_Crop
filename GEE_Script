@@ -1,0 +1,120 @@
+// ================================================
+// AI-Driven Flood Impact Analysis on Agriculture
+// Remote Sensing Dataset Preparation using GEE
+// ================================================
+
+// 1. Area of Interest (AOI)
+var aoi = geometry;  // Use geometry drawn on the map
+Map.centerObject(aoi, 8);
+
+// 2. Sentinel-2 Cloud Masking Function
+function maskS2(image) {
+  var qa = image.select('QA60');
+  var cloudMask = 1 << 10;
+  var cirrusMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudMask).eq(0).and(qa.bitwiseAnd(cirrusMask).eq(0));
+  return image.updateMask(mask).divide(10000);  // Scale reflectance
+}
+
+// 3. Sentinel-2 Imagery During Flood Period
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate('2022-08-01', '2022-09-30')
+  .filterBounds(aoi)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
+  .map(maskS2)
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+  .first()
+  .clip(aoi);
+
+var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// 4. Sentinel-1 Radar for Flood Mapping
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterDate('2022-08-01', '2022-09-30')
+  .filterBounds(aoi)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV')
+  .mean()
+  .clip(aoi);
+
+// 5. VHI Calculation: Lower VHI = Flooded
+var vhi = ndvi.subtract(s1).rename('VHI');
+var flood_mask = vhi.lt(0.2);  // Threshold for flooding
+
+// 6. Peak NDVI for Wheat and Rice
+function peakNDVI(start, end) {
+  return ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterDate(start, end)
+    .filterBounds(aoi)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
+    .map(maskS2)
+    .sort('CLOUDY_PIXEL_PERCENTAGE')
+    .first()
+    .normalizedDifference(['B8', 'B4'])
+    .rename('NDVI');
+}
+
+var wheat_mask = peakNDVI('2022-03-01', '2022-03-31').gte(0.3).selfMask();
+var rice_mask  = peakNDVI('2022-08-01', '2022-08-31').gte(0.3).selfMask();
+
+// 7. Affected / Unaffected Combinations
+var wheat_affected   = wheat_mask.and(flood_mask);
+var rice_affected    = rice_mask.and(flood_mask);
+var wheat_unaffected = wheat_mask.and(flood_mask.not());
+var rice_unaffected  = rice_mask.and(flood_mask.not());
+
+// 8. Generate 2km Tile Grid
+var grid = aoi.coveringGrid(ee.Projection('EPSG:4326'), 2000);
+
+// 9. Label Tiles Based on Crop & Flood Condition
+var labeled = grid.map(function(tile) {
+  var geom = tile.geometry();
+
+  var wheat_a = wheat_affected.reduceRegion({reducer: ee.Reducer.anyNonZero(), geometry: geom, scale: 10}).values().get(0);
+  var rice_a  = rice_affected.reduceRegion({reducer: ee.Reducer.anyNonZero(), geometry: geom, scale: 10}).values().get(0);
+  var wheat_u = wheat_unaffected.reduceRegion({reducer: ee.Reducer.anyNonZero(), geometry: geom, scale: 10}).values().get(0);
+  var rice_u  = rice_unaffected.reduceRegion({reducer: ee.Reducer.anyNonZero(), geometry: geom, scale: 10}).values().get(0);
+
+  var label = ee.Algorithms.If(wheat_a, 'wheat_affected',
+               ee.Algorithms.If(rice_a, 'rice_affected',
+               ee.Algorithms.If(wheat_u, 'wheat_unaffected',
+               ee.Algorithms.If(rice_u, 'rice_unaffected', null))));
+
+  return tile.set('label', label);
+}).filter(ee.Filter.neq('label', null));
+
+print('✅ Total labeled tiles:', labeled.size());
+Map.addLayer(labeled, {color: 'yellow'}, 'Labeled Tiles');
+
+// 10. Export Tiles – Batch Export of Affected/Unaffected Only
+var filtered = labeled.filter(ee.Filter.inList('label', ['wheat_affected', 'rice_affected', 'wheat_unaffected', 'rice_unaffected']));
+var exportList = filtered.toList(filtered.size());
+var listSize = exportList.size().getInfo();  // total tiles
+var j = 468;  // start index for filenames
+
+for (var i = 0; i < listSize; i++) {
+  var tile = ee.Feature(exportList.get(i));
+  var geom = tile.geometry();
+  var label = tile.get('label');
+  var filename = 'tile_' + j + '_' + label.getInfo();
+  j++;
+
+  var patch = s2.select(['B4', 'B3', 'B2'])  // RGB bands
+                .addBands(ndvi)              // Add NDVI
+                .clip(geom);
+
+  Export.image.toDrive({
+    image: patch,
+    description: filename,
+    folder: 'Pakistan_Crop_TrainSet',
+    fileNamePrefix: filename,
+    region: geom,
+    scale: 10,
+    maxPixels: 1e13
+  });
+}
+
+// 11. Visualization
+Map.addLayer(wheat_affected.updateMask(wheat_affected), {palette: 'blue'}, 'Wheat Affected');
+Map.addLayer(rice_affected.updateMask(rice_affected), {palette: 'red'}, 'Rice Affected');
